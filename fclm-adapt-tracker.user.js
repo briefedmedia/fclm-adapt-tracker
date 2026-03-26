@@ -1,5 +1,5 @@
 // ==UserScript==
-// @name         FCLM Associate ADAPT Tracker
+// @name         Should I Code? 🤔
 // @namespace    https://fclm-adapt-tracker
 // @version      1.2.0
 // @description  Collaborative AA status tracking for HDC3 warehouse managers
@@ -31,10 +31,10 @@
 
   // ─── Status Definitions ──────────────────────────────────────────
   const STATUSES = {
-    stu_pending:  { key: 'stu_pending',  label: 'STU Pending',  bg: '#fff3cd', border: '#ffc107', icon: '\u23F3', priority: 2 },
+    stu_pending: { key: 'stu_pending', label: 'STU Pending', bg: '#fff3cd', border: '#ffc107', icon: '\u23F3', priority: 2 },
     stu_complete: { key: 'stu_complete', label: 'STU Complete', bg: '#ffe0b2', border: '#ff9800', icon: '\u2705', priority: 3 },
-    writeup:      { key: 'writeup',      label: 'Write-Up',     bg: '#f8d7da', border: '#dc3545', icon: '\u270D\uFE0F', priority: 1 },
-    resolved:     { key: 'resolved',     label: 'Resolved',     bg: '#d1e7dd', border: '#198754', icon: '\u2714\uFE0F', priority: 4 },
+    writeup: { key: 'writeup', label: 'Write-Up', bg: '#f8d7da', border: '#dc3545', icon: '\u270D\uFE0F', priority: 1 },
+    resolved: { key: 'resolved', label: 'Resolved', bg: '#d1e7dd', border: '#198754', icon: '\u2714\uFE0F', priority: 4 },
   };
 
   // ─── State ───────────────────────────────────────────────────────
@@ -666,7 +666,7 @@
     panel.innerHTML = `
       <div class="fclm-panel-header" id="fclm-panel-drag">
         <div style="display:flex;align-items:center;">
-          <span class="fclm-title">Associate ADAPT Tracker</span>
+          <span class="fclm-title">Should I Code? 🤔</span>
           <span class="fclm-badge" id="fclm-badge-count">0</span>
           <span class="fclm-status-dot" id="fclm-status-dot" title="Firebase status"></span>
         </div>
@@ -1385,7 +1385,7 @@
       modal.innerHTML = `
         <div class="fclm-alias-header">
           <div class="fclm-alias-logo">\uD83D\uDCCB</div>
-          <h2>Associate ADAPT Tracker</h2>
+          <h2>Should I Code? 🤔</h2>
           <p>${isChange ? 'Update your manager alias' : 'Welcome! Enter your login to get started.'}</p>
         </div>
         <div class="fclm-alias-body">
@@ -1450,7 +1450,7 @@
   // ─── Initialization ──────────────────────────────────────────────
 
   async function init() {
-    log('Initializing FCLM Associate ADAPT Tracker...');
+    log('Initializing Should I Code?...');
 
     // Detect page type and date early (before UI)
     currentPageType = detectPageType();

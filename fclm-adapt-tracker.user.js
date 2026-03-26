@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Should I Code? 🤔
 // @namespace    https://fclm-adapt-tracker
-// @version      1.2.3
+// @version      1.2.4
 // @author       Micah Griffth | Area Manager II | HDC3
 // @description  Collaborative AA status tracking for HDC3 warehouse managers
 // @match        https://fclm-portal.amazon.com/*
@@ -231,30 +231,86 @@
     log('Login resolution complete, cached', Object.keys(loginCache).length, 'entries');
   }
 
-  // Returns best display label for an employee: "Last, First (login)" when possible
+  // Check if a string looks like a real person name (contains comma or space)
+  function isRealName(str) {
+    return str && /[,\s]/.test(str) && !/^\d+$/.test(str);
+  }
+
+  // Returns best display label for an employee: "Last, First (login)" when possible.
+  // Cross-references all data sources by login to produce consistent output
+  // regardless of which page the marking was created from.
   function getDisplayLabel(empId, fallbackName) {
+    const isNumericId = /^\d+$/.test(empId);
+
+    // Step 1: Determine login — from cache, or empId itself if it's a login
     const cached = loginCache[empId];
-    const login = cached ? cached.login : null;
+    let login = cached ? cached.login : null;
+    if (!login && !isNumericId) {
+      login = empId; // empId IS a login (e.g. "mgrffth")
+    }
 
-    let name = fallbackName || null;
+    // Step 2: Find best name — check all sources in priority order
+    let name = null;
+
+    // 2a. Page-detected employees (most current)
     const emp = detectedEmployees[empId];
-    if (emp && emp.empName && emp.empName !== empId && /\s/.test(emp.empName)) {
+    if (emp && isRealName(emp.empName)) {
       name = emp.empName;
-    } else if (!name || name === empId) {
-      name = emp ? emp.empName : null;
-    }
-    // Also check marking data — the name may have been stored from a different page
-    if ((!name || name === empId) && currentMarkings[sanitizeKey(empId)]) {
-      const storedName = currentMarkings[sanitizeKey(empId)].employeeName;
-      if (storedName && storedName !== empId) name = storedName;
     }
 
-    if (name && name !== empId && login) {
+    // 2b. Fallback name passed in (usually from marking's employeeName)
+    if (!name && isRealName(fallbackName)) {
+      name = fallbackName;
+    }
+
+    // 2c. Stored marking data
+    if (!name) {
+      const marking = currentMarkings[sanitizeKey(empId)];
+      if (marking && isRealName(marking.employeeName)) {
+        name = marking.employeeName;
+      }
+    }
+
+    // 2d. Cross-reference by login: scan all detected employees and markings
+    // for any entry whose login matches, to find the name from another page
+    if (!name && login) {
+      const lowerLogin = login.toLowerCase();
+
+      // Scan detected employees
+      for (const [detId, det] of Object.entries(detectedEmployees)) {
+        const detCached = loginCache[detId];
+        if (detCached && detCached.login && detCached.login.toLowerCase() === lowerLogin && isRealName(det.empName)) {
+          name = det.empName;
+          break;
+        }
+      }
+
+      // Scan current markings
+      if (!name) {
+        for (const m of Object.values(currentMarkings)) {
+          if (!m || !isRealName(m.employeeName)) continue;
+          // Check if this marking's login matches
+          const mCached = loginCache[m.employeeId];
+          if (mCached && mCached.login && mCached.login.toLowerCase() === lowerLogin) {
+            name = m.employeeName;
+            break;
+          }
+          // Check if the marking's employeeId IS the login
+          if (!(/^\d+$/.test(m.employeeId)) && m.employeeId.toLowerCase() === lowerLogin) {
+            name = m.employeeName;
+            break;
+          }
+        }
+      }
+    }
+
+    // Step 3: Format output — always "Last, First (login)" when both available
+    if (name && login) {
       return `${formatName(name)} (${login})`;
+    } else if (name) {
+      return formatName(name);
     } else if (login) {
       return login;
-    } else if (name && name !== empId) {
-      return formatName(name);
     }
     return empId;
   }

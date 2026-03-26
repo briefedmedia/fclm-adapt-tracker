@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Should I Code? 🤔
 // @namespace    https://fclm-adapt-tracker
-// @version      1.2.1
+// @version      1.2.2
 // @author       Micah Griffth | Area Manager II | HDC3
 // @description  Collaborative AA status tracking for HDC3 warehouse managers
 // @match        https://fclm-portal.amazon.com/*
@@ -50,6 +50,7 @@
   let currentPageType = '';
   let pendingRemoteChanges = false;
   let firebaseConnected = false;
+  let lastSaveTime = 0;
 
   // ─── Utility Functions ───────────────────────────────────────────
 
@@ -109,6 +110,12 @@
   function escapeHtml(str) {
     if (!str) return '';
     return str.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+  }
+
+  // Normalize name formatting: "Last,First" → "Last, First"
+  function formatName(name) {
+    if (!name) return '';
+    return name.replace(/,(\S)/g, ', $1');
   }
 
   function log(...args) {
@@ -243,11 +250,11 @@
     }
 
     if (name && name !== empId && login) {
-      return `${name} (${login})`;
+      return `${formatName(name)} (${login})`;
     } else if (login) {
       return login;
     } else if (name && name !== empId) {
-      return name;
+      return formatName(name);
     }
     return empId;
   }
@@ -302,7 +309,10 @@
   }
 
   function getPersistentPath() {
-    return `/${WAREHOUSE_ID}/persistent`;
+    // Stored under markings/_persistent so it shares the same Firebase rules.
+    // The underscore prefix won't conflict with date keys (YYYY-MM-DD) and
+    // won't be cleaned up by cleanupOldMarkings (NaN date check skips it).
+    return `/${WAREHOUSE_ID}/markings/_persistent`;
   }
 
   async function fetchMarkings() {
@@ -319,6 +329,7 @@
 
   async function saveMarking(empId, marking) {
     const key = sanitizeKey(empId);
+    lastSaveTime = Date.now();
     let result;
     if (marking.persistent) {
       // Save to persistent path, clean up date-based path
@@ -344,6 +355,7 @@
 
   async function deleteMarking(empId) {
     const key = sanitizeKey(empId);
+    lastSaveTime = Date.now();
     // Delete from both paths to ensure cleanup
     await Promise.all([
       firebaseRequest('DELETE', `${getMarkingsPath()}/${key}`),
@@ -403,6 +415,11 @@
   // ─── Polling & Sync ──────────────────────────────────────────────
 
   async function pollMarkings() {
+    // Skip poll if a save happened in the last 5 seconds to prevent stale data overwrite
+    if (Date.now() - lastSaveTime < 5000) {
+      log('Skipping poll — recent save');
+      return;
+    }
     const newMarkings = await fetchMarkings();
     const oldJson = JSON.stringify(currentMarkings);
     const newJson = JSON.stringify(newMarkings);
@@ -1069,7 +1086,7 @@
     // Login: from cache, or if the URL empId itself is a login (not numeric)
     const login = cached ? cached.login : (!isNumericId ? empId : null);
     // Name: from detection (heading parse), fall back to login or empId
-    let nameDisplay = rawName && rawName !== empId ? rawName : (login || empId);
+    let nameDisplay = rawName && rawName !== empId ? formatName(rawName) : (login || empId);
     // Sub-line: always prefer showing AA Login when we have it
     const subLine = login ? `AA Login: ${login}` : `Employee ID: ${empId}`;
     const marking = currentMarkings[sanitizeKey(empId)];

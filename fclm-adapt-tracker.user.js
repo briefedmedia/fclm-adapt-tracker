@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Should I Code? 🤔
 // @namespace    https://fclm-adapt-tracker
-// @version      1.1.1
+// @version      1.2.0
 // @author       Micah Griffth | Area Manager II | HDC3
 // @description  Collaborative AA status tracking for HDC3 warehouse managers
 // @match        https://fclm-portal.amazon.com/*
@@ -25,7 +25,6 @@
   const FIREBASE_DB_URL = 'https://fclm-adapt-tracker-default-rtdb.firebaseio.com';
   const WAREHOUSE_ID = 'HDC3';
   const POLL_INTERVAL_MS = 10000;
-  const DEBUG = true;
   const CONTENT_WAIT_INTERVAL = 500;
   const CONTENT_WAIT_MAX = 30;
   const CLEANUP_HOURS = 48;
@@ -96,6 +95,12 @@
     return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
   }
 
+  function formatDate(ts) {
+    if (!ts) return '';
+    const d = new Date(ts);
+    return d.toLocaleDateString([], { month: 'short', day: 'numeric' }) + ' ' + formatTime(ts);
+  }
+
   function truncate(str, len) {
     if (!str) return '';
     return str.length > len ? str.slice(0, len) + '\u2026' : str;
@@ -107,7 +112,7 @@
   }
 
   function log(...args) {
-    if (DEBUG) console.log('[FCLM Tracker]', ...args);
+    console.log('[FCLM Tracker]', ...args);
   }
 
   // ─── Link Classification ────────────────────────────────────────
@@ -200,7 +205,6 @@
 
     log('Resolving logins for', needed.length, 'employees');
 
-    // Batch in groups of 100 (ADAPT API limit)
     const batches = [];
     for (let i = 0; i < needed.length; i += 100) {
       batches.push(needed.slice(i, i + 100));
@@ -225,11 +229,9 @@
     const cached = loginCache[empId];
     const login = cached ? cached.login : null;
 
-    // Determine the best name available
     let name = fallbackName || null;
     const emp = detectedEmployees[empId];
     if (emp && emp.empName && emp.empName !== empId && /\s/.test(emp.empName)) {
-      // Prefer detected name with a space (real name like "Last, First")
       name = emp.empName;
     } else if (!name || name === empId) {
       name = emp ? emp.empName : null;
@@ -299,16 +301,40 @@
     return `/${WAREHOUSE_ID}/markings/${currentDateKey}`;
   }
 
+  function getPersistentPath() {
+    return `/${WAREHOUSE_ID}/persistent`;
+  }
+
   async function fetchMarkings() {
-    const data = await firebaseRequest('GET', getMarkingsPath());
-    return data || {};
+    const [dateData, persistData] = await Promise.all([
+      firebaseRequest('GET', getMarkingsPath()),
+      firebaseRequest('GET', getPersistentPath()),
+    ]);
+    const merged = {};
+    if (dateData) Object.assign(merged, dateData);
+    // Persistent markings override date-based ones for the same employee
+    if (persistData) Object.assign(merged, persistData);
+    return merged;
   }
 
   async function saveMarking(empId, marking) {
     const key = sanitizeKey(empId);
-    const result = await firebaseRequest('PUT', `${getMarkingsPath()}/${key}`, marking);
+    let result;
+    if (marking.persistent) {
+      // Save to persistent path, clean up date-based path
+      [result] = await Promise.all([
+        firebaseRequest('PUT', `${getPersistentPath()}/${key}`, marking),
+        firebaseRequest('DELETE', `${getMarkingsPath()}/${key}`),
+      ]);
+    } else {
+      // Save to date path, clean up persistent path
+      [result] = await Promise.all([
+        firebaseRequest('PUT', `${getMarkingsPath()}/${key}`, marking),
+        firebaseRequest('DELETE', `${getPersistentPath()}/${key}`),
+      ]);
+    }
     if (result) {
-      log('Marking saved successfully:', key, result);
+      log('Marking saved successfully:', key);
     } else {
       log('WARNING: Marking may not have saved for', key);
       showToast('Warning: Could not save to server. Check connection.');
@@ -318,7 +344,11 @@
 
   async function deleteMarking(empId) {
     const key = sanitizeKey(empId);
-    return firebaseRequest('DELETE', `${getMarkingsPath()}/${key}`);
+    // Delete from both paths to ensure cleanup
+    await Promise.all([
+      firebaseRequest('DELETE', `${getMarkingsPath()}/${key}`),
+      firebaseRequest('DELETE', `${getPersistentPath()}/${key}`),
+    ]);
   }
 
   async function cleanupOldMarkings() {
@@ -333,6 +363,41 @@
         await firebaseRequest('DELETE', `/${WAREHOUSE_ID}/markings/${dateKey}`);
       }
     }
+  }
+
+  // ─── Start of Shift / Persistent Clearing ────────────────────────
+
+  async function startOfShift() {
+    // Delete all today's date-based markings
+    await firebaseRequest('DELETE', getMarkingsPath());
+
+    // Check persistent markings — remove any whose persistUntil has passed
+    const persistData = await firebaseRequest('GET', getPersistentPath());
+    if (persistData) {
+      const now = Date.now();
+      const deletes = [];
+      for (const [key, marking] of Object.entries(persistData)) {
+        if (marking.persistUntil && marking.persistUntil <= now) {
+          deletes.push(firebaseRequest('DELETE', `${getPersistentPath()}/${key}`));
+        }
+      }
+      if (deletes.length > 0) await Promise.all(deletes);
+    }
+
+    // Refresh
+    currentMarkings = await fetchMarkings();
+    refreshAllUI();
+    const remaining = Object.keys(currentMarkings).length;
+    showToast(remaining > 0
+      ? `Shift started \u2014 cleared all except ${remaining} persistent entry(s)`
+      : 'Shift started \u2014 all markings cleared');
+  }
+
+  async function clearAllPersistent() {
+    await firebaseRequest('DELETE', getPersistentPath());
+    currentMarkings = await fetchMarkings();
+    refreshAllUI();
+    showToast('All persistent markings cleared');
   }
 
   // ─── Polling & Sync ──────────────────────────────────────────────
@@ -404,7 +469,18 @@
       if (!found[empId]) {
         found[empId] = { empId, empName: empName || empId, links: [], rows: [] };
       }
-      if (empName && empName !== empId) found[empId].empName = empName;
+      if (empName && empName !== empId) {
+        // On profile pages, only accept names that contain a comma ("Last, First")
+        // or are a single-word login. This prevents page navigation text like
+        // "Time Details" or "Current Punches" from being used as a name.
+        if (isProfilePage()) {
+          if (empName.includes(',') || /^[a-zA-Z]+$/.test(empName.trim())) {
+            found[empId].empName = empName;
+          }
+        } else {
+          found[empId].empName = empName;
+        }
+      }
       if (link && !found[empId].links.includes(link)) found[empId].links.push(link);
       if (row && !found[empId].rows.includes(row)) found[empId].rows.push(row);
     }
@@ -446,21 +522,9 @@
     // Strategy 5: Profile page URL
     if (isProfilePage()) {
       const empId = extractEmpIdFromHref(window.location.href);
-      if (empId) {
-        // On profile pages, don't trust h1/h2 for names — they often contain
-        // page section titles like "Current Punches" instead of the employee name.
-        // The login cache (ADAPT API) is the reliable source for identity here.
-        // Only use name from links that actually reference this employee.
-        let empName = null;
-        const empLinks = document.querySelectorAll(`a[href*="employeeId=${empId}"]`);
-        for (const a of empLinks) {
-          const text = (a.textContent || '').trim();
-          if (text && /\s/.test(text) && text !== empId) {
-            empName = text;
-            break;
-          }
-        }
-        addEmployee(empId, empName, null, null);
+      if (empId && !found[empId]) {
+        // Only add if not already found by earlier strategies
+        addEmployee(empId, null, null, null);
       }
     }
 
@@ -654,6 +718,30 @@
       .fclm-btn-cancel { background: #f0f0f0; color: #333; }
       .fclm-btn-cancel:hover { background: #ddd; }
 
+      /* ─── Persistent Marking Option ─── */
+      .fclm-persistent-option {
+        margin-bottom: 16px; padding: 10px 12px; background: #f8f9fa;
+        border-radius: 8px; border: 1px solid #e9ecef;
+      }
+      .fclm-persistent-label {
+        display: flex; align-items: center; gap: 8px; font-size: 13px;
+        font-weight: 600; cursor: pointer; margin: 0;
+      }
+      .fclm-persistent-label input[type="checkbox"] { accent-color: #232f3e; width: 16px; height: 16px; }
+      .fclm-persistent-date {
+        margin-top: 10px;
+      }
+      .fclm-persistent-date label {
+        display: block; font-size: 12px; font-weight: 600; color: #555; margin-bottom: 4px;
+      }
+      .fclm-persistent-date input[type="datetime-local"] {
+        width: 100%; box-sizing: border-box; border: 1px solid #d5d9d9; border-radius: 8px;
+        padding: 8px 10px; font-size: 13px; font-family: inherit; transition: border-color 0.2s;
+      }
+      .fclm-persistent-date input[type="datetime-local"]:focus {
+        outline: none; border-color: #ff9900; box-shadow: 0 0 0 2px rgba(255,153,0,0.2);
+      }
+
       /* ─── Alias Modal (first-run) ─── */
       .fclm-alias-modal {
         background: #fff; border-radius: 14px; width: 380px; max-width: 90vw;
@@ -709,23 +797,6 @@
         pointer-events: none; box-shadow: 0 4px 12px rgba(0,0,0,0.2);
       }
       .fclm-toast.show { opacity: 1; }
-
-      /* ─── Debug Panel ─── */
-      #fclm-debug-panel {
-        position: fixed; bottom: 10px; left: 10px; width: 420px; max-height: 50vh;
-        background: #1e1e1e; color: #d4d4d4; border-radius: 8px; padding: 12px;
-        font-family: 'Consolas', 'Monaco', monospace; font-size: 11px;
-        overflow-y: auto; z-index: 99998; box-shadow: 0 4px 20px rgba(0,0,0,0.3);
-        display: none;
-      }
-      #fclm-debug-panel.visible { display: block; }
-      #fclm-debug-panel h4 { color: #ff9900; margin: 8px 0 4px; font-size: 12px; }
-      #fclm-debug-panel .dbg-section {
-        margin-bottom: 6px; padding: 4px; background: #2d2d2d; border-radius: 4px;
-      }
-      #fclm-debug-panel details { margin: 4px 0; }
-      #fclm-debug-panel summary { cursor: pointer; color: #ff9900; font-weight: 600; }
-      #fclm-debug-panel pre { white-space: pre-wrap; word-break: break-all; margin: 2px 0; }
     `);
   }
 
@@ -742,6 +813,44 @@
     toast.textContent = msg;
     toast.classList.add('show');
     setTimeout(() => toast.classList.remove('show'), 3000);
+  }
+
+  // ─── Styled Confirmation Modal ──────────────────────────────────
+
+  function showConfirmModal(title, message, confirmLabel, cancelLabel) {
+    confirmLabel = confirmLabel || 'Confirm';
+    cancelLabel = cancelLabel || 'Cancel';
+    return new Promise((resolve) => {
+      closeAllModals();
+      const backdrop = document.createElement('div');
+      backdrop.className = 'fclm-modal-backdrop';
+      backdrop.id = 'fclm-modal-backdrop';
+
+      const modal = document.createElement('div');
+      modal.className = 'fclm-modal';
+      modal.innerHTML = `
+        <div class="fclm-modal-header">${escapeHtml(title)}</div>
+        <div class="fclm-modal-content">
+          <p style="margin:0;font-size:13px;color:#333;line-height:1.5;">${message}</p>
+        </div>
+        <div class="fclm-modal-actions">
+          <button class="fclm-btn-cancel" id="fclm-confirm-cancel">${escapeHtml(cancelLabel)}</button>
+          <button class="fclm-btn-save" id="fclm-confirm-ok">${escapeHtml(confirmLabel)}</button>
+        </div>
+      `;
+      backdrop.appendChild(modal);
+      document.body.appendChild(backdrop);
+
+      modal.querySelector('#fclm-confirm-ok').addEventListener('click', () => {
+        closeAllModals(); resolve(true);
+      });
+      modal.querySelector('#fclm-confirm-cancel').addEventListener('click', () => {
+        closeAllModals(); resolve(false);
+      });
+      backdrop.addEventListener('click', (e) => {
+        if (e.target === backdrop) { closeAllModals(); resolve(false); }
+      });
+    });
   }
 
   // ─── Remote Change Notification ──────────────────────────────────
@@ -776,7 +885,7 @@
         <div class="fclm-header-buttons">
           <button id="fclm-btn-add" title="Manual Add">+</button>
           <button id="fclm-btn-refresh" title="Refresh">\u21BB</button>
-          ${DEBUG ? '<button id="fclm-btn-debug" title="Debug">\uD83D\uDC1B</button>' : ''}
+          <button id="fclm-btn-sos" title="Start of Shift">\uD83C\uDF05</button>
           <button id="fclm-btn-minimize" title="Minimize">\u2500</button>
         </div>
       </div>
@@ -796,37 +905,37 @@
 
     document.body.appendChild(panel);
 
-    // Drag
     makeDraggable(panel, document.getElementById('fclm-panel-drag'));
 
-    // Minimize
     document.getElementById('fclm-btn-minimize').addEventListener('click', () => {
       panel.classList.toggle('minimized');
       document.getElementById('fclm-btn-minimize').textContent = panel.classList.contains('minimized') ? '\u25A1' : '\u2500';
     });
 
-    // Manual Add
     document.getElementById('fclm-btn-add').addEventListener('click', openManualAddModal);
 
-    // Refresh
     document.getElementById('fclm-btn-refresh').addEventListener('click', async () => {
       const m = await fetchMarkings();
       applyRemoteChanges(m);
       showToast('Refreshed');
     });
 
-    // Sync Now (remote changes)
+    document.getElementById('fclm-btn-sos').addEventListener('click', async () => {
+      const confirmed = await showConfirmModal(
+        '\uD83C\uDF05 Start of Shift',
+        'This will clear all markings for today <strong>except</strong> entries marked as persistent (locked for a future shift).<br><br>Expired persistent entries will also be unlocked and cleared.<br><br>Are you sure?',
+        'Start Shift',
+        'Cancel'
+      );
+      if (confirmed) await startOfShift();
+    });
+
     document.getElementById('fclm-btn-sync-now').addEventListener('click', () => {
       if (pendingRemoteMarkings) {
         applyRemoteChanges(pendingRemoteMarkings);
         showToast('Synced with latest changes');
       }
     });
-
-    // Debug
-    if (DEBUG) {
-      document.getElementById('fclm-btn-debug').addEventListener('click', toggleDebugPanel);
-    }
 
     updateFooterInfo();
   }
@@ -870,12 +979,16 @@
     body.innerHTML = entries.map(m => {
       const s = STATUSES[m.status] || STATUSES.stu_pending;
       const displayName = getDisplayLabel(m.employeeId, m.employeeName);
+      const persistIcon = m.persistent ? ' \uD83D\uDD12' : '';
+      const persistMeta = m.persistent && m.persistUntil
+        ? ` \u00B7 until ${formatDate(m.persistUntil)}`
+        : '';
       return `
         <div class="fclm-marking-item" data-empid="${escapeHtml(m.employeeId)}" style="border-left-color:${s.border}">
           <span class="fclm-mi-icon">${s.icon}</span>
           <div class="fclm-mi-body">
-            <div class="fclm-mi-name">${escapeHtml(displayName)}</div>
-            <div class="fclm-mi-meta">${s.label} \u00B7 by ${escapeHtml(m.markedBy)} \u00B7 ${formatTime(m.timestamp)}</div>
+            <div class="fclm-mi-name">${escapeHtml(displayName)}${persistIcon}</div>
+            <div class="fclm-mi-meta">${s.label} \u00B7 by ${escapeHtml(m.markedBy)} \u00B7 ${formatTime(m.timestamp)}${persistMeta}</div>
             ${m.notes ? `<div class="fclm-mi-notes">${escapeHtml(truncate(m.notes, 60))}</div>` : ''}
           </div>
         </div>
@@ -944,8 +1057,9 @@
     if (marking && s) {
       statusContent = `
         <div class="fclm-ps-status-card" style="background:${s.bg};border-left-color:${s.border}">
-          <div class="fclm-ps-status-label">${s.icon} ${s.label}</div>
+          <div class="fclm-ps-status-label">${s.icon} ${s.label}${marking.persistent ? ' \uD83D\uDD12' : ''}</div>
           <div class="fclm-ps-status-meta">Marked by ${escapeHtml(marking.markedBy)} at ${formatTime(marking.timestamp)}</div>
+          ${marking.persistent && marking.persistUntil ? `<div class="fclm-ps-status-meta">Persistent until ${formatDate(marking.persistUntil)}</div>` : ''}
           ${marking.notes ? `<div class="fclm-ps-status-notes">${escapeHtml(marking.notes)}</div>` : ''}
         </div>
         <div class="fclm-ps-actions">
@@ -968,33 +1082,85 @@
       ${statusContent}
     `;
 
-    // Expand with animation
     requestAnimationFrame(() => {
       section.classList.add('expanded');
     });
 
-    // Attach button events
     const markBtn = section.querySelector('#fclm-ps-mark');
     const changeBtn = section.querySelector('#fclm-ps-change');
     const clearBtn = section.querySelector('#fclm-ps-clear');
 
     if (markBtn) {
-      markBtn.addEventListener('click', () => openMarkingModal(empId, rawName));
+      markBtn.addEventListener('click', () => openMarkingModal(empId, rawName || empId));
     }
     if (changeBtn) {
-      changeBtn.addEventListener('click', () => openMarkingModal(empId, rawName));
+      changeBtn.addEventListener('click', () => openMarkingModal(empId, rawName || empId));
     }
     if (clearBtn) {
       clearBtn.addEventListener('click', async () => {
         await deleteMarking(empId);
         delete currentMarkings[sanitizeKey(empId)];
         refreshAllUI();
-        showToast(`Cleared marking for ${displayName}`);
+        showToast(`Cleared marking for ${getDisplayLabel(empId, rawName)}`);
       });
     }
   }
 
   // ─── Marking Modal ──────────────────────────────────────────────
+
+  function buildPersistentOptionHTML(existing) {
+    const isChecked = existing && existing.persistent ? 'checked' : '';
+    const dateDisplay = existing && existing.persistent ? '' : 'display:none';
+    let dateVal = '';
+    if (existing && existing.persistUntil) {
+      const d = new Date(existing.persistUntil);
+      // Format as YYYY-MM-DDTHH:MM for datetime-local input
+      const pad = (n) => String(n).padStart(2, '0');
+      dateVal = `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
+    }
+    return `
+      <div class="fclm-persistent-option">
+        <label class="fclm-persistent-label">
+          <input type="checkbox" id="fclm-persistent-check" ${isChecked}>
+          \uD83D\uDD12 Keep for future shift
+        </label>
+        <div class="fclm-persistent-date" id="fclm-persistent-date" style="${dateDisplay}">
+          <label>Remove after:</label>
+          <input type="datetime-local" id="fclm-persist-until" value="${dateVal}">
+        </div>
+      </div>
+    `;
+  }
+
+  function setupPersistentOptionEvents(modal) {
+    const persistCheck = modal.querySelector('#fclm-persistent-check');
+    const persistDateDiv = modal.querySelector('#fclm-persistent-date');
+    const persistUntilInput = modal.querySelector('#fclm-persist-until');
+    if (!persistCheck) return;
+
+    persistCheck.addEventListener('change', () => {
+      persistDateDiv.style.display = persistCheck.checked ? '' : 'none';
+      if (persistCheck.checked && !persistUntilInput.value) {
+        // Default to tomorrow at 6:00 AM
+        const tomorrow = new Date();
+        tomorrow.setDate(tomorrow.getDate() + 1);
+        tomorrow.setHours(6, 0, 0, 0);
+        const pad = (n) => String(n).padStart(2, '0');
+        persistUntilInput.value = `${tomorrow.getFullYear()}-${pad(tomorrow.getMonth() + 1)}-${pad(tomorrow.getDate())}T${pad(tomorrow.getHours())}:${pad(tomorrow.getMinutes())}`;
+      }
+    });
+  }
+
+  function getPersistentValues(modal) {
+    const persistCheck = modal.querySelector('#fclm-persistent-check');
+    const persistUntilInput = modal.querySelector('#fclm-persist-until');
+    const isPersistent = persistCheck && persistCheck.checked;
+    let persistUntil = null;
+    if (isPersistent && persistUntilInput && persistUntilInput.value) {
+      persistUntil = new Date(persistUntilInput.value).getTime();
+    }
+    return { persistent: isPersistent || false, persistUntil };
+  }
 
   function openMarkingModal(empId, empName) {
     closeAllModals();
@@ -1014,6 +1180,7 @@
         <div class="fclm-existing-info">
           Currently marked as <strong>${(STATUSES[existing.status] || {}).label || existing.status}</strong>
           by <strong>${escapeHtml(existing.markedBy)}</strong> at ${formatTime(existing.timestamp)}
+          ${existing.persistent ? ' \uD83D\uDD12' : ''}
           ${existing.notes ? `<br>Notes: ${escapeHtml(existing.notes)}` : ''}
         </div>
       `;
@@ -1039,6 +1206,7 @@
           `).join('')}
         </div>
         <textarea id="fclm-notes" placeholder="Optional notes...">${existing && existing.notes ? escapeHtml(existing.notes) : ''}</textarea>
+        ${buildPersistentOptionHTML(existing)}
       </div>
       <div class="fclm-modal-actions">
         ${existing ? '<button class="fclm-btn-clear" id="fclm-modal-clear">Clear</button>' : ''}
@@ -1059,10 +1227,18 @@
       });
     });
 
+    // Persistent option toggle
+    setupPersistentOptionEvents(modal);
+
     // Save
     modal.querySelector('#fclm-modal-save').addEventListener('click', async () => {
       const selected = modal.querySelector('input[name="fclm-status"]:checked');
       if (!selected) { showToast('Please select a status'); return; }
+      const { persistent, persistUntil } = getPersistentValues(modal);
+      if (persistent && !persistUntil) {
+        showToast('Please select a date/time for the persistent entry');
+        return;
+      }
       const marking = {
         employeeId: empId,
         employeeName: empName || empId,
@@ -1070,12 +1246,14 @@
         markedBy: managerAlias,
         timestamp: Date.now(),
         notes: modal.querySelector('#fclm-notes').value.trim(),
+        persistent,
+        persistUntil,
       };
       await saveMarking(empId, marking);
       currentMarkings[sanitizeKey(empId)] = marking;
       refreshAllUI();
       closeAllModals();
-      showToast(`Marked ${escapeHtml(displayName)} as ${STATUSES[selected.value].label}`);
+      showToast(`Marked ${escapeHtml(displayName)} as ${STATUSES[selected.value].label}${persistent ? ' \uD83D\uDD12' : ''}`);
     });
 
     // Clear
@@ -1124,6 +1302,7 @@
           `).join('')}
         </div>
         <textarea id="fclm-notes" placeholder="Optional notes..."></textarea>
+        ${buildPersistentOptionHTML(null)}
       </div>
       <div class="fclm-modal-actions">
         <button class="fclm-btn-cancel" id="fclm-modal-cancel">Cancel</button>
@@ -1143,18 +1322,25 @@
       });
     });
 
+    // Persistent option toggle
+    setupPersistentOptionEvents(modal);
+
     modal.querySelector('#fclm-modal-save').addEventListener('click', async () => {
       const input = modal.querySelector('#fclm-manual-empid').value.trim();
       if (!input) { showToast('Please enter an employee ID or login'); return; }
       const selected = modal.querySelector('input[name="fclm-status"]:checked');
       if (!selected) { showToast('Please select a status'); return; }
+      const { persistent, persistUntil } = getPersistentValues(modal);
+      if (persistent && !persistUntil) {
+        showToast('Please select a date/time for the persistent entry');
+        return;
+      }
 
       let empId = input;
       let empName = input;
       const isLogin = /^[a-zA-Z]+$/.test(input);
 
       if (isLogin) {
-        // Input looks like a login — try to resolve to employee ID via login cache
         let resolved = false;
         for (const [cachedId, entry] of Object.entries(loginCache)) {
           if (entry.login && entry.login.toLowerCase() === input.toLowerCase()) {
@@ -1164,11 +1350,10 @@
             break;
           }
         }
-        // Also check detected employees on the page
         if (!resolved) {
           for (const [detId, emp] of Object.entries(detectedEmployees)) {
-            const cached = loginCache[detId];
-            if (cached && cached.login && cached.login.toLowerCase() === input.toLowerCase()) {
+            const cachedEntry = loginCache[detId];
+            if (cachedEntry && cachedEntry.login && cachedEntry.login.toLowerCase() === input.toLowerCase()) {
               empId = detId;
               empName = emp.empName || input;
               resolved = true;
@@ -1176,7 +1361,6 @@
             }
           }
         }
-        // If still not resolved, try calling ADAPT API with the login as an ID lookup
         if (!resolved) {
           showToast('Looking up login...');
           const data = await fetchEmployeeLogins([input]);
@@ -1189,7 +1373,6 @@
             };
             saveLoginCache();
           } else {
-            // Can't resolve — save with the login as-is
             log('Could not resolve login to employee ID:', input);
           }
         }
@@ -1202,13 +1385,15 @@
         markedBy: managerAlias,
         timestamp: Date.now(),
         notes: modal.querySelector('#fclm-notes').value.trim(),
+        persistent,
+        persistUntil,
       };
       await saveMarking(empId, marking);
       currentMarkings[sanitizeKey(empId)] = marking;
       refreshAllUI();
       closeAllModals();
-      const displayName = getDisplayLabel(empId, empName);
-      showToast(`Marked ${displayName} as ${STATUSES[selected.value].label}`);
+      const displayLabel = getDisplayLabel(empId, empName);
+      showToast(`Marked ${displayLabel} as ${STATUSES[selected.value].label}${persistent ? ' \uD83D\uDD12' : ''}`);
     });
 
     modal.querySelector('#fclm-modal-cancel').addEventListener('click', closeAllModals);
@@ -1239,7 +1424,6 @@
   // ─── Row/Link Highlighting ──────────────────────────────────────
 
   function applyHighlights() {
-    // Clear old highlights
     document.querySelectorAll('.fclm-row-highlight').forEach(el => {
       el.classList.remove('fclm-row-highlight');
       el.style.backgroundColor = '';
@@ -1254,7 +1438,6 @@
       const emp = detectedEmployees[marking.employeeId];
       if (!emp) continue;
 
-      // Row highlighting
       const rowsDone = new Set();
       emp.rows.forEach(row => {
         if (row && !rowsDone.has(row)) {
@@ -1265,7 +1448,6 @@
         }
       });
 
-      // Inline badge — one per row, next to the name link (badge priority: name > login > id)
       const badgeRowsDone = new Set();
       for (const row of emp.rows) {
         if (!row || badgeRowsDone.has(row)) continue;
@@ -1276,8 +1458,9 @@
           badge.className = 'fclm-inline-badge';
           badge.style.backgroundColor = s.bg;
           badge.style.color = s.border;
-          badge.title = `${s.label} \u2014 by ${marking.markedBy} at ${formatTime(marking.timestamp)}${marking.notes ? '\n' + marking.notes : ''}`;
-          badge.innerHTML = `${s.icon} ${s.label}`;
+          const persistNote = marking.persistent ? ' \uD83D\uDD12' : '';
+          badge.title = `${s.label} \u2014 by ${marking.markedBy} at ${formatTime(marking.timestamp)}${persistNote}${marking.notes ? '\n' + marking.notes : ''}`;
+          badge.innerHTML = `${s.icon} ${s.label}${persistNote}`;
           badgeLink.parentElement.insertBefore(badge, badgeLink.nextSibling?.nextSibling || null);
         }
       }
@@ -1330,90 +1513,12 @@
     observer.observe(document.body, { childList: true, subtree: true });
   }
 
-  // ─── Debug Panel ────────────────────────────────────────────────
-
-  function createDebugPanel() {
-    if (!DEBUG) return;
-    const panel = document.createElement('div');
-    panel.id = 'fclm-debug-panel';
-    document.body.appendChild(panel);
-  }
-
-  function toggleDebugPanel() {
-    const panel = document.getElementById('fclm-debug-panel');
-    if (!panel) return;
-    panel.classList.toggle('visible');
-    if (panel.classList.contains('visible')) updateDebugPanel();
-  }
-
-  function updateDebugPanel() {
-    const panel = document.getElementById('fclm-debug-panel');
-    if (!panel || !panel.classList.contains('visible')) return;
-
-    const empEntries = Object.entries(detectedEmployees);
-    const allEmpLinks = document.querySelectorAll('a[href*="employeeId"]');
-    const tables = document.querySelectorAll('table');
-    const cachedLogins = Object.keys(loginCache).length;
-
-    panel.innerHTML = `
-      <h4>FCLM Tracker Debug</h4>
-      <div class="dbg-section">
-        <div>Page type: <strong>${currentPageType}</strong></div>
-        <div>URL: ${truncate(window.location.href, 80)}</div>
-        <div>Date key: <strong>${currentDateKey}</strong></div>
-        <div>Firebase: <strong>${firebaseConnected ? 'Connected' : 'Disconnected'}</strong></div>
-        <div>Manager: <strong>${escapeHtml(managerAlias)}</strong></div>
-        <div>Markings: <strong>${Object.keys(currentMarkings).length}</strong></div>
-        <div>Detected employees: <strong>${empEntries.length}</strong></div>
-        <div>Cached logins: <strong>${cachedLogins}</strong></div>
-      </div>
-
-      <details>
-        <summary>Detected Employees (${empEntries.length})</summary>
-        <pre>${empEntries.map(([id, e]) => {
-          const login = loginCache[id] ? loginCache[id].login : '?';
-          return `${id}: ${e.empName} [login: ${login}] (${e.links.length} links, ${e.rows.length} rows)`;
-        }).join('\n') || 'None'}</pre>
-      </details>
-
-      <details>
-        <summary>Employee Links on Page (${allEmpLinks.length})</summary>
-        <pre>${Array.from(allEmpLinks).slice(0, 30).map(a => truncate(a.href, 100)).join('\n') || 'None'}</pre>
-      </details>
-
-      <details>
-        <summary>Tables (${tables.length})</summary>
-        <pre>${Array.from(tables).map((t, i) => {
-          const rows = t.querySelectorAll('tr');
-          const hdrs = Array.from(t.querySelectorAll('th')).map(h => h.textContent.trim()).slice(0, 8);
-          return `Table ${i}: ${rows.length} rows | Headers: ${hdrs.join(', ') || 'none'}`;
-        }).join('\n') || 'None'}</pre>
-      </details>
-
-      <details>
-        <summary>Current Markings</summary>
-        <pre>${JSON.stringify(currentMarkings, null, 2)}</pre>
-      </details>
-
-      <details>
-        <summary>Login Cache</summary>
-        <pre>${JSON.stringify(loginCache, null, 2)}</pre>
-      </details>
-
-      <details>
-        <summary>Raw DOM (first 3000 chars)</summary>
-        <pre>${(document.body.innerHTML || '').substring(0, 3000).replace(/</g, '&lt;')}</pre>
-      </details>
-    `;
-  }
-
   // ─── Refresh All UI ──────────────────────────────────────────────
 
   function refreshAllUI() {
     updatePanelBody();
     applyHighlights();
     updateProfileSection();
-    if (DEBUG) updateDebugPanel();
   }
 
   // ─── Content Wait Strategy ──────────────────────────────────────
@@ -1457,10 +1562,16 @@
     });
 
     GM_registerMenuCommand('Clear All My Markings (Today)', async () => {
-      if (!confirm(`Clear all markings made by "${managerAlias}" for today (${currentDateKey})?`)) return;
+      const confirmed = await showConfirmModal(
+        'Clear My Markings',
+        `This will remove all markings made by <strong>${escapeHtml(managerAlias)}</strong> for today (${currentDateKey}).<br><br>Persistent entries will not be affected.`,
+        'Clear',
+        'Cancel'
+      );
+      if (!confirmed) return;
       let cleared = 0;
       for (const [key, marking] of Object.entries(currentMarkings)) {
-        if (marking && marking.markedBy === managerAlias) {
+        if (marking && marking.markedBy === managerAlias && !marking.persistent) {
           await deleteMarking(marking.employeeId);
           delete currentMarkings[key];
           cleared++;
@@ -1470,18 +1581,31 @@
       showToast(`Cleared ${cleared} marking(s)`);
     });
 
+    GM_registerMenuCommand('Clear All Persistent Markings (Site-wide)', async () => {
+      const confirmed = await showConfirmModal(
+        '\uD83D\uDD12 Clear Persistent Markings',
+        'This will permanently remove <strong>all persistent (locked) entries</strong> across the entire site for all managers.<br><br>This cannot be undone. Are you sure?',
+        'Clear All Persistent',
+        'Cancel'
+      );
+      if (!confirmed) return;
+      await clearAllPersistent();
+    });
+
     GM_registerMenuCommand('Export Today\'s Markings (CSV)', () => {
       const entries = Object.values(currentMarkings).filter(m => m && m.status);
       if (entries.length === 0) { showToast('No markings to export'); return; }
-      const header = 'Employee ID,Name,Login,Status,Marked By,Time,Notes';
+      const header = 'Employee ID,Name,Login,Status,Marked By,Time,Notes,Persistent,Persist Until';
       const rows = entries.map(m => {
         const esc = (s) => `"${String(s || '').replace(/"/g, '""')}"`;
-        const cached = loginCache[m.employeeId];
-        const login = cached ? cached.login || '' : '';
+        const cachedLogin = loginCache[m.employeeId];
+        const login = cachedLogin ? cachedLogin.login || '' : '';
         return [
           esc(m.employeeId), esc(m.employeeName), esc(login),
           esc((STATUSES[m.status] || {}).label || m.status),
           esc(m.markedBy), esc(formatTime(m.timestamp)), esc(m.notes),
+          esc(m.persistent ? 'Yes' : 'No'),
+          esc(m.persistUntil ? formatDate(m.persistUntil) : ''),
         ].join(',');
       });
       const csv = [header, ...rows].join('\n');
@@ -1586,11 +1710,9 @@
     await ensureAlias();
     log('Manager login:', managerAlias);
 
-    // Load cached logins from local storage
     loadLoginCache();
 
     createPanel();
-    createDebugPanel();
 
     registerMenuCommands();
 
@@ -1599,7 +1721,6 @@
 
     detectEmployees();
 
-    // Fetch markings from Firebase
     const markings = await fetchMarkings();
     if (markings !== null) {
       currentMarkings = markings;
@@ -1613,7 +1734,6 @@
       refreshAllUI();
     });
 
-    // Initial UI render (with whatever login data is cached)
     refreshAllUI();
 
     setupContextMenu();
@@ -1622,13 +1742,11 @@
 
     startPolling();
 
-    // Cleanup old markings (fire and forget)
     cleanupOldMarkings();
 
     log('Initialization complete. Detected', Object.keys(detectedEmployees).length, 'employees,', Object.keys(currentMarkings).length, 'markings');
   }
 
-  // Start
   init();
 
 })();

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Should I Code? 🤔
 // @namespace    https://fclm-adapt-tracker
-// @version      1.2.0
+// @version      1.2.1
 // @description  Collaborative AA status tracking for HDC3 warehouse managers
 // @match        https://fclm-portal.amazon.com/*
 // @grant        GM_setValue

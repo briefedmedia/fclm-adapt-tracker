@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Should I Code? 🤔
 // @namespace    https://fclm-adapt-tracker
-// @version      1.1.0
+// @version      1.1.1
 // @author       Micah Griffth | Area Manager II | HDC3
 // @description  Collaborative AA status tracking for HDC3 warehouse managers
 // @match        https://fclm-portal.amazon.com/*
@@ -234,6 +234,11 @@
     } else if (!name || name === empId) {
       name = emp ? emp.empName : null;
     }
+    // Also check marking data — the name may have been stored from a different page
+    if ((!name || name === empId) && currentMarkings[sanitizeKey(empId)]) {
+      const storedName = currentMarkings[sanitizeKey(empId)].employeeName;
+      if (storedName && storedName !== empId) name = storedName;
+    }
 
     if (name && name !== empId && login) {
       return `${name} (${login})`;
@@ -442,24 +447,17 @@
     if (isProfilePage()) {
       const empId = extractEmpIdFromHref(window.location.href);
       if (empId) {
+        // On profile pages, don't trust h1/h2 for names — they often contain
+        // page section titles like "Current Punches" instead of the employee name.
+        // The login cache (ADAPT API) is the reliable source for identity here.
+        // Only use name from links that actually reference this employee.
         let empName = null;
-        // Try specific employee name selectors first
-        const nameSelectors = ['.employee-name', '[class*="employeeName"]', '[class*="employee-name"]'];
-        for (const sel of nameSelectors) {
-          const el = document.querySelector(sel);
-          if (el) {
-            const text = el.textContent.trim();
-            if (text) { empName = text; break; }
-          }
-        }
-        // Fall back to h1/h2 but skip warning/error/task headings
-        if (!empName) {
-          for (const el of document.querySelectorAll('h1, h2')) {
-            const text = el.textContent.trim();
-            if (text && !/warning|error|task\s*assignment/i.test(text) && text.length < 80) {
-              empName = text;
-              break;
-            }
+        const empLinks = document.querySelectorAll(`a[href*="employeeId=${empId}"]`);
+        for (const a of empLinks) {
+          const text = (a.textContent || '').trim();
+          if (text && /\s/.test(text) && text !== empId) {
+            empName = text;
+            break;
           }
         }
         addEmployee(empId, empName, null, null);
@@ -487,7 +485,7 @@
     GM_addStyle(`
       /* ─── Side Panel ─── */
       #fclm-tracker-panel {
-        position: fixed; top: 10px; right: 10px; width: 340px;
+        position: fixed; top: 60px; right: 10px; width: 340px;
         background: #fff; border: 1px solid #ccc; border-radius: 10px;
         box-shadow: 0 4px 24px rgba(0,0,0,0.15); z-index: 99999;
         font-family: 'Amazon Ember', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
@@ -932,8 +930,13 @@
     }
 
     const emp = detectedEmployees[empId];
-    const rawName = emp ? emp.empName : empId;
-    const displayName = getDisplayLabel(empId, rawName);
+    const rawName = emp ? emp.empName : null;
+    const cached = loginCache[empId];
+    const login = cached ? cached.login : null;
+    // For the profile section header, show name on its own line (no login suffix)
+    // and show login on a separate sub-line
+    let nameDisplay = rawName && rawName !== empId ? rawName : (login || empId);
+    const subLine = login ? `AA Login: ${login}` : `Employee ID: ${empId}`;
     const marking = currentMarkings[sanitizeKey(empId)];
     const s = marking ? STATUSES[marking.status] : null;
 
@@ -960,8 +963,8 @@
     }
 
     section.innerHTML = `
-      <div class="fclm-ps-empname">${escapeHtml(displayName)}</div>
-      <div class="fclm-ps-empid">Employee ID: ${escapeHtml(empId)}</div>
+      <div class="fclm-ps-empname">${escapeHtml(nameDisplay)}</div>
+      <div class="fclm-ps-empid">${escapeHtml(subLine)}</div>
       ${statusContent}
     `;
 
@@ -1141,13 +1144,60 @@
     });
 
     modal.querySelector('#fclm-modal-save').addEventListener('click', async () => {
-      const empId = modal.querySelector('#fclm-manual-empid').value.trim();
-      if (!empId) { showToast('Please enter an employee ID or login'); return; }
+      const input = modal.querySelector('#fclm-manual-empid').value.trim();
+      if (!input) { showToast('Please enter an employee ID or login'); return; }
       const selected = modal.querySelector('input[name="fclm-status"]:checked');
       if (!selected) { showToast('Please select a status'); return; }
+
+      let empId = input;
+      let empName = input;
+      const isLogin = /^[a-zA-Z]+$/.test(input);
+
+      if (isLogin) {
+        // Input looks like a login — try to resolve to employee ID via login cache
+        let resolved = false;
+        for (const [cachedId, entry] of Object.entries(loginCache)) {
+          if (entry.login && entry.login.toLowerCase() === input.toLowerCase()) {
+            empId = cachedId;
+            empName = input;
+            resolved = true;
+            break;
+          }
+        }
+        // Also check detected employees on the page
+        if (!resolved) {
+          for (const [detId, emp] of Object.entries(detectedEmployees)) {
+            const cached = loginCache[detId];
+            if (cached && cached.login && cached.login.toLowerCase() === input.toLowerCase()) {
+              empId = detId;
+              empName = emp.empName || input;
+              resolved = true;
+              break;
+            }
+          }
+        }
+        // If still not resolved, try calling ADAPT API with the login as an ID lookup
+        if (!resolved) {
+          showToast('Looking up login...');
+          const data = await fetchEmployeeLogins([input]);
+          if (data && Object.keys(data).length > 0) {
+            const resolvedId = Object.keys(data)[0];
+            empId = resolvedId;
+            loginCache[resolvedId] = {
+              login: data[resolvedId].login || input,
+              timestamp: Date.now(),
+            };
+            saveLoginCache();
+          } else {
+            // Can't resolve — save with the login as-is
+            log('Could not resolve login to employee ID:', input);
+          }
+        }
+      }
+
       const marking = {
         employeeId: empId,
-        employeeName: empId,
+        employeeName: empName,
         status: selected.value,
         markedBy: managerAlias,
         timestamp: Date.now(),
@@ -1157,7 +1207,8 @@
       currentMarkings[sanitizeKey(empId)] = marking;
       refreshAllUI();
       closeAllModals();
-      showToast(`Marked ${empId} as ${STATUSES[selected.value].label}`);
+      const displayName = getDisplayLabel(empId, empName);
+      showToast(`Marked ${displayName} as ${STATUSES[selected.value].label}`);
     });
 
     modal.querySelector('#fclm-modal-cancel').addEventListener('click', closeAllModals);

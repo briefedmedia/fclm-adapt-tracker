@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Should I Code? 🤔
 // @namespace    https://fclm-adapt-tracker
-// @version      1.2.4
+// @version      1.2.5
 // @author       Micah Griffth | Area Manager II | HDC3
 // @description  Collaborative AA status tracking for HDC3 warehouse managers
 // @match        https://fclm-portal.amazon.com/*
@@ -1282,6 +1282,48 @@
     return { persistent: isPersistent || false, persistUntil };
   }
 
+  // Resolve the best real name for an employee to store in Firebase.
+  // Unlike getDisplayLabel (for display), this returns just the name without login.
+  function resolveBestName(empId, fallbackName) {
+    const isNumericId = /^\d+$/.test(empId);
+
+    // Check detected employees (has row-scanned names)
+    const emp = detectedEmployees[empId];
+    if (emp && isRealName(emp.empName)) return formatName(emp.empName);
+
+    // Check fallback
+    if (isRealName(fallbackName)) return formatName(fallbackName);
+
+    // Check stored markings
+    const marking = currentMarkings[sanitizeKey(empId)];
+    if (marking && isRealName(marking.employeeName)) return formatName(marking.employeeName);
+
+    // Cross-reference by login
+    const cached = loginCache[empId];
+    const login = cached ? cached.login : (!isNumericId ? empId : null);
+    if (login) {
+      const lowerLogin = login.toLowerCase();
+      for (const [detId, det] of Object.entries(detectedEmployees)) {
+        const dc = loginCache[detId];
+        if (dc && dc.login && dc.login.toLowerCase() === lowerLogin && isRealName(det.empName)) {
+          return formatName(det.empName);
+        }
+      }
+      for (const m of Object.values(currentMarkings)) {
+        if (!m) continue;
+        const mc = loginCache[m.employeeId];
+        if (mc && mc.login && mc.login.toLowerCase() === lowerLogin && isRealName(m.employeeName)) {
+          return formatName(m.employeeName);
+        }
+        if (!(/^\d+$/.test(m.employeeId)) && m.employeeId.toLowerCase() === lowerLogin && isRealName(m.employeeName)) {
+          return formatName(m.employeeName);
+        }
+      }
+    }
+
+    return fallbackName || empId;
+  }
+
   function openMarkingModal(empId, empName) {
     closeAllModals();
     const existing = currentMarkings[sanitizeKey(empId)] || null;
@@ -1359,9 +1401,10 @@
         showToast('Please select a date/time for the persistent entry');
         return;
       }
+      const bestName = resolveBestName(empId, empName);
       const marking = {
         employeeId: empId,
-        employeeName: empName || empId,
+        employeeName: bestName,
         status: selected.value,
         markedBy: managerAlias,
         timestamp: Date.now(),
@@ -1498,9 +1541,10 @@
         }
       }
 
+      const bestName = resolveBestName(empId, empName);
       const marking = {
         employeeId: empId,
-        employeeName: empName,
+        employeeName: bestName,
         status: selected.value,
         markedBy: managerAlias,
         timestamp: Date.now(),
@@ -1512,7 +1556,7 @@
       currentMarkings[sanitizeKey(empId)] = marking;
       refreshAllUI();
       closeAllModals();
-      const displayLabel = getDisplayLabel(empId, empName);
+      const displayLabel = getDisplayLabel(empId, bestName);
       showToast(`Marked ${displayLabel} as ${STATUSES[selected.value].label}${persistent ? ' \uD83D\uDD12' : ''}`);
     });
 

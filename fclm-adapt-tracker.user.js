@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FCLM Associate ADAPT Tracker
 // @namespace    https://fclm-adapt-tracker
-// @version      1.1.0
+// @version      1.2.0
 // @description  Collaborative AA status tracking for HDC3 warehouse managers
 // @match        https://fclm-portal.amazon.com/*
 // @grant        GM_setValue
@@ -11,6 +11,8 @@
 // @grant        GM_registerMenuCommand
 // @connect      firebaseio.com
 // @connect      fclm-adapt-tracker-default-rtdb.firebaseio.com
+// @updateURL    https://raw.githubusercontent.com/briefedmedia/fclm-adapt-tracker/main/fclm-adapt-tracker.user.js
+// @downloadURL  https://raw.githubusercontent.com/briefedmedia/fclm-adapt-tracker/main/fclm-adapt-tracker.user.js
 // @run-at       document-idle
 // ==/UserScript==
 
@@ -230,9 +232,28 @@
     const newJson = JSON.stringify(newMarkings);
     if (oldJson !== newJson) {
       if (!isFirstPoll) {
-        // Don't auto-apply — show notification banner instead
-        pendingRemoteChanges = true;
-        showRemoteChangeNotification(newMarkings);
+        // Check if all changes were made by the current user
+        const onlyMyChanges = Object.keys(newMarkings).every(key => {
+          const oldM = currentMarkings[key];
+          const newM = newMarkings[key];
+          if (JSON.stringify(oldM) === JSON.stringify(newM)) return true;
+          return newM && newM.markedBy === managerAlias;
+        }) && Object.keys(currentMarkings).every(key => {
+          // Also check deletions — if a key was removed, check who owned it
+          if (newMarkings[key]) return true;
+          const oldM = currentMarkings[key];
+          return oldM && oldM.markedBy === managerAlias;
+        });
+
+        if (onlyMyChanges) {
+          // Silently apply — these are our own changes echoed back
+          currentMarkings = newMarkings;
+          refreshAllUI();
+        } else {
+          // Another manager made changes — show notification
+          pendingRemoteChanges = true;
+          showRemoteChangeNotification(newMarkings);
+        }
       } else {
         currentMarkings = newMarkings;
         refreshAllUI();

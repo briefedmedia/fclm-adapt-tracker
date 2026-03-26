@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Should I Code? 🤔
 // @namespace    https://fclm-adapt-tracker
-// @version      1.0.0
+// @version      1.1.0
 // @author       Micah Griffth | Area Manager II | HDC3
 // @description  Collaborative AA status tracking for HDC3 warehouse managers
 // @match        https://fclm-portal.amazon.com/*
@@ -12,6 +12,7 @@
 // @grant        GM_registerMenuCommand
 // @connect      firebaseio.com
 // @connect      fclm-adapt-tracker-default-rtdb.firebaseio.com
+// @connect      adapt-iad.amazon.com
 // @updateURL    https://raw.githubusercontent.com/briefedmedia/fclm-adapt-tracker/main/fclm-adapt-tracker.user.js
 // @downloadURL  https://raw.githubusercontent.com/briefedmedia/fclm-adapt-tracker/main/fclm-adapt-tracker.user.js
 // @run-at       document-idle
@@ -29,6 +30,7 @@
   const CONTENT_WAIT_MAX = 30;
   const CLEANUP_HOURS = 48;
   const DEBOUNCE_MS = 800;
+  const LOGIN_CACHE_TTL = 7 * 24 * 60 * 60 * 1000; // 7 days
 
   // ─── Status Definitions ──────────────────────────────────────────
   const STATUSES = {
@@ -42,6 +44,7 @@
   let managerAlias = '';
   let currentMarkings = {};
   let detectedEmployees = {};
+  let loginCache = {};
   let pollTimer = null;
   let isFirstPoll = true;
   let currentDateKey = '';
@@ -107,10 +110,9 @@
     if (DEBUG) console.log('[FCLM Tracker]', ...args);
   }
 
-  // ─── Link Classification (for dedup: login > name > id) ────────
-  // Classifies a link's text to determine priority for button injection.
+  // ─── Link Classification ────────────────────────────────────────
   // login = lowercase no spaces, not pure digits (e.g. "jsmith")
-  // name  = contains a space (e.g. "John Smith")
+  // name  = contains a space (e.g. "Smith, John")
   // id    = pure digits or fallback (e.g. "202303565")
   function classifyLinkText(text) {
     if (!text) return 'id';
@@ -118,14 +120,14 @@
     if (!text) return 'id';
     if (/^\d+$/.test(text)) return 'id';
     if (/\s/.test(text)) return 'name';
-    return 'login'; // no spaces, not pure digits = login
+    return 'login';
   }
 
-  const LINK_PRIORITY = { login: 1, name: 2, id: 3 };
+  // Badge placement priority: prefer name links so badges appear next to
+  // the human-readable name column, not the employee ID or login column.
+  const BADGE_PRIORITY = { name: 1, login: 2, id: 3 };
 
-  // Pick the best link for a given employee within a specific row.
-  // Returns the single link that should get the mark button.
-  function pickPrimaryLink(emp, row) {
+  function pickBadgeLink(emp, row) {
     const candidates = row
       ? emp.links.filter(l => l.closest && l.closest('tr') === row)
       : emp.links;
@@ -133,11 +135,114 @@
     if (candidates.length === 1) return candidates[0];
 
     candidates.sort((a, b) => {
-      const pa = LINK_PRIORITY[classifyLinkText(a.textContent)] || 3;
-      const pb = LINK_PRIORITY[classifyLinkText(b.textContent)] || 3;
+      const pa = BADGE_PRIORITY[classifyLinkText(a.textContent)] || 3;
+      const pb = BADGE_PRIORITY[classifyLinkText(b.textContent)] || 3;
       return pa - pb;
     });
     return candidates[0];
+  }
+
+  // ─── Login Cache (ADAPT API) ─────────────────────────────────────
+
+  function loadLoginCache() {
+    try {
+      const stored = GM_getValue('fclm_loginCache', '');
+      if (stored) loginCache = JSON.parse(stored);
+    } catch { loginCache = {}; }
+  }
+
+  function saveLoginCache() {
+    GM_setValue('fclm_loginCache', JSON.stringify(loginCache));
+  }
+
+  function fetchEmployeeLogins(employeeIds) {
+    return new Promise((resolve) => {
+      const url = 'https://adapt-iad.amazon.com/api/employee-profile-svc/GetEmployeeProfiles?employeeLogins=' + JSON.stringify(employeeIds);
+      GM_xmlhttpRequest({
+        method: 'GET',
+        url,
+        timeout: 10000,
+        onload(res) {
+          try {
+            const data = typeof res.responseText === 'object' ? res.responseText : JSON.parse(res.responseText);
+            resolve(data || {});
+          } catch {
+            log('ADAPT API parse error');
+            resolve({});
+          }
+        },
+        onerror() { log('ADAPT API network error'); resolve({}); },
+        ontimeout() { log('ADAPT API timeout'); resolve({}); },
+      });
+    });
+  }
+
+  async function resolveLogins() {
+    const allIds = new Set();
+    for (const empId of Object.keys(detectedEmployees)) {
+      allIds.add(empId);
+    }
+    for (const marking of Object.values(currentMarkings)) {
+      if (marking && marking.employeeId) allIds.add(marking.employeeId);
+    }
+
+    const now = Date.now();
+    const needed = [];
+    for (const id of allIds) {
+      if (loginCache[id] && loginCache[id].timestamp > now - LOGIN_CACHE_TTL) continue;
+      needed.push(id);
+    }
+
+    if (needed.length === 0) {
+      log('All logins already cached');
+      return;
+    }
+
+    log('Resolving logins for', needed.length, 'employees');
+
+    // Batch in groups of 100 (ADAPT API limit)
+    const batches = [];
+    for (let i = 0; i < needed.length; i += 100) {
+      batches.push(needed.slice(i, i + 100));
+    }
+
+    for (const batch of batches) {
+      const data = await fetchEmployeeLogins(batch);
+      for (const [empId, profile] of Object.entries(data)) {
+        loginCache[empId] = {
+          login: profile.login || null,
+          timestamp: now,
+        };
+      }
+    }
+
+    saveLoginCache();
+    log('Login resolution complete, cached', Object.keys(loginCache).length, 'entries');
+  }
+
+  // Returns best display label for an employee: "Last, First (login)" when possible
+  function getDisplayLabel(empId, fallbackName) {
+    const cached = loginCache[empId];
+    const login = cached ? cached.login : null;
+
+    // Determine the best name available
+    let name = fallbackName || null;
+    const emp = detectedEmployees[empId];
+    if (emp && emp.empName && emp.empName !== empId && /\s/.test(emp.empName)) {
+      // Prefer detected name with a space (real name like "Last, First")
+      name = emp.empName;
+    } else if (!name || name === empId) {
+      name = emp ? emp.empName : null;
+    }
+
+    if (name && name !== empId && login) {
+      return `${name} (${login})`;
+    } else if (login) {
+      return login;
+    } else if (name && name !== empId) {
+      return name;
+    }
+    return empId;
   }
 
   // ─── Firebase REST API ───────────────────────────────────────────
@@ -233,25 +338,21 @@
     const newJson = JSON.stringify(newMarkings);
     if (oldJson !== newJson) {
       if (!isFirstPoll) {
-        // Check if all changes were made by the current user
         const onlyMyChanges = Object.keys(newMarkings).every(key => {
           const oldM = currentMarkings[key];
           const newM = newMarkings[key];
           if (JSON.stringify(oldM) === JSON.stringify(newM)) return true;
           return newM && newM.markedBy === managerAlias;
         }) && Object.keys(currentMarkings).every(key => {
-          // Also check deletions — if a key was removed, check who owned it
           if (newMarkings[key]) return true;
           const oldM = currentMarkings[key];
           return oldM && oldM.markedBy === managerAlias;
         });
 
         if (onlyMyChanges) {
-          // Silently apply — these are our own changes echoed back
           currentMarkings = newMarkings;
           refreshAllUI();
         } else {
-          // Another manager made changes — show notification
           pendingRemoteChanges = true;
           showRemoteChangeNotification(newMarkings);
         }
@@ -342,8 +443,25 @@
       const empId = extractEmpIdFromHref(window.location.href);
       if (empId) {
         let empName = null;
-        const h1 = document.querySelector('h1, h2, .employee-name, [class*="employeeName"]');
-        if (h1) empName = h1.textContent.trim();
+        // Try specific employee name selectors first
+        const nameSelectors = ['.employee-name', '[class*="employeeName"]', '[class*="employee-name"]'];
+        for (const sel of nameSelectors) {
+          const el = document.querySelector(sel);
+          if (el) {
+            const text = el.textContent.trim();
+            if (text) { empName = text; break; }
+          }
+        }
+        // Fall back to h1/h2 but skip warning/error/task headings
+        if (!empName) {
+          for (const el of document.querySelectorAll('h1, h2')) {
+            const text = el.textContent.trim();
+            if (text && !/warning|error|task\s*assignment/i.test(text) && text.length < 80) {
+              empName = text;
+              break;
+            }
+          }
+        }
         addEmployee(empId, empName, null, null);
       }
     }
@@ -378,7 +496,8 @@
       }
       #fclm-tracker-panel.minimized { width: 240px; }
       #fclm-tracker-panel.minimized .fclm-panel-body,
-      #fclm-tracker-panel.minimized .fclm-panel-footer { display: none; }
+      #fclm-tracker-panel.minimized .fclm-panel-footer,
+      #fclm-tracker-panel.minimized .fclm-profile-section { display: none; }
 
       .fclm-panel-header {
         display: flex; align-items: center; justify-content: space-between;
@@ -407,12 +526,36 @@
       }
       .fclm-header-buttons button:hover { background: rgba(255,255,255,0.25); }
 
-      .fclm-panel-body {
-        overflow-y: auto; flex: 1; padding: 8px; min-height: 40px; max-height: 60vh;
+      /* ─── Profile Section (inside side panel) ─── */
+      .fclm-profile-section {
+        max-height: 0; overflow: hidden;
+        transition: max-height 0.4s ease, padding 0.3s ease;
+        padding: 0 14px; border-bottom: none; flex-shrink: 0;
       }
-      .fclm-panel-body .fclm-empty {
-        text-align: center; color: #aaa; padding: 24px 10px; font-style: italic; font-size: 12px;
+      .fclm-profile-section.expanded {
+        max-height: 350px; padding: 12px 14px;
+        border-bottom: 1px solid #eee;
       }
+      .fclm-profile-section .fclm-ps-empname { font-weight: 700; font-size: 15px; margin-bottom: 2px; }
+      .fclm-profile-section .fclm-ps-empid { font-size: 11px; color: #777; margin-bottom: 10px; }
+      .fclm-profile-section .fclm-ps-status-card {
+        padding: 10px 12px; border-radius: 8px; border-left: 4px solid; margin-bottom: 10px;
+      }
+      .fclm-profile-section .fclm-ps-status-label { font-weight: 700; font-size: 14px; margin-bottom: 2px; }
+      .fclm-profile-section .fclm-ps-status-meta { font-size: 11px; color: #555; }
+      .fclm-profile-section .fclm-ps-status-notes { font-size: 12px; font-style: italic; color: #555; margin-top: 4px; }
+      .fclm-profile-section .fclm-ps-no-status { color: #aaa; font-style: italic; padding: 8px 0; }
+      .fclm-profile-section .fclm-ps-actions { display: flex; gap: 6px; margin-top: 8px; }
+      .fclm-profile-section .fclm-ps-actions button {
+        flex: 1; padding: 7px 12px; border-radius: 6px; border: none; cursor: pointer;
+        font-size: 12px; font-weight: 600; transition: background 0.15s;
+      }
+      .fclm-ps-btn-mark { background: #232f3e; color: #fff; }
+      .fclm-ps-btn-mark:hover { background: #37475a; }
+      .fclm-ps-btn-change { background: #ff9900; color: #111; }
+      .fclm-ps-btn-change:hover { background: #e68a00; }
+      .fclm-ps-btn-clear { background: #f8d7da; color: #dc3545; }
+      .fclm-ps-btn-clear:hover { background: #f1c0c5; }
 
       /* ─── Remote change notification ─── */
       .fclm-remote-notice {
@@ -426,6 +569,13 @@
         margin-left: auto; white-space: nowrap;
       }
       .fclm-remote-notice button:hover { background: #1976d2; }
+
+      .fclm-panel-body {
+        overflow-y: auto; flex: 1; padding: 8px; min-height: 40px; max-height: 60vh;
+      }
+      .fclm-panel-body .fclm-empty {
+        text-align: center; color: #aaa; padding: 24px 10px; font-style: italic; font-size: 12px;
+      }
 
       .fclm-marking-item {
         display: flex; align-items: flex-start; padding: 8px 10px; margin-bottom: 4px;
@@ -443,42 +593,6 @@
         padding: 8px 14px; border-top: 1px solid #eee; font-size: 10px; color: #999;
         flex-shrink: 0;
       }
-
-      /* ─── Profile Employee Panel ─── */
-      #fclm-profile-panel {
-        position: fixed; top: 10px; left: 10px; width: 320px;
-        background: #fff; border: 1px solid #ccc; border-radius: 10px;
-        box-shadow: 0 4px 24px rgba(0,0,0,0.15); z-index: 99998;
-        font-family: 'Amazon Ember', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-        font-size: 13px; color: #333; display: flex; flex-direction: column;
-      }
-      #fclm-profile-panel .fclm-pp-header {
-        padding: 10px 14px; background: linear-gradient(135deg, #232f3e, #37475a);
-        color: #fff; border-radius: 10px 10px 0 0; font-weight: 700; font-size: 13px;
-        display: flex; align-items: center; justify-content: space-between;
-        cursor: move; user-select: none;
-      }
-      #fclm-profile-panel .fclm-pp-body { padding: 12px 14px; }
-      #fclm-profile-panel .fclm-pp-empname { font-weight: 700; font-size: 15px; margin-bottom: 2px; }
-      #fclm-profile-panel .fclm-pp-empid { font-size: 11px; color: #777; margin-bottom: 10px; }
-      #fclm-profile-panel .fclm-pp-status-card {
-        padding: 10px 12px; border-radius: 8px; border-left: 4px solid; margin-bottom: 10px;
-      }
-      #fclm-profile-panel .fclm-pp-status-label { font-weight: 700; font-size: 14px; margin-bottom: 2px; }
-      #fclm-profile-panel .fclm-pp-status-meta { font-size: 11px; color: #555; }
-      #fclm-profile-panel .fclm-pp-status-notes { font-size: 12px; font-style: italic; color: #555; margin-top: 4px; }
-      #fclm-profile-panel .fclm-pp-no-status { color: #aaa; font-style: italic; padding: 8px 0; }
-      #fclm-profile-panel .fclm-pp-actions { display: flex; gap: 6px; margin-top: 8px; }
-      #fclm-profile-panel .fclm-pp-actions button {
-        flex: 1; padding: 7px 12px; border-radius: 6px; border: none; cursor: pointer;
-        font-size: 12px; font-weight: 600; transition: background 0.15s;
-      }
-      .fclm-pp-btn-mark { background: #232f3e; color: #fff; }
-      .fclm-pp-btn-mark:hover { background: #37475a; }
-      .fclm-pp-btn-change { background: #ff9900; color: #111; }
-      .fclm-pp-btn-change:hover { background: #e68a00; }
-      .fclm-pp-btn-clear { background: #f8d7da; color: #dc3545; }
-      .fclm-pp-btn-clear:hover { background: #f1c0c5; }
 
       /* ─── Modal ─── */
       .fclm-modal-backdrop {
@@ -578,16 +692,6 @@
       .fclm-alias-footer button:hover { background: #e68a00; }
       .fclm-alias-footer button:disabled { background: #ccc; cursor: not-allowed; }
 
-      /* ─── Mark Buttons ─── */
-      .fclm-mark-btn {
-        display: inline-flex; align-items: center; gap: 3px;
-        background: #232f3e; color: #fff; border: none; border-radius: 4px;
-        padding: 2px 6px; font-size: 11px; cursor: pointer; margin-left: 4px;
-        font-family: inherit; vertical-align: middle; line-height: 1.4;
-        transition: background 0.15s;
-      }
-      .fclm-mark-btn:hover { background: #37475a; }
-
       /* ─── Inline Badge ─── */
       .fclm-inline-badge {
         display: inline-flex; align-items: center; gap: 3px;
@@ -667,7 +771,7 @@
     panel.innerHTML = `
       <div class="fclm-panel-header" id="fclm-panel-drag">
         <div style="display:flex;align-items:center;">
-          <span class="fclm-title">Should I Code? 🤔</span>
+          <span class="fclm-title">Should I Code? \uD83E\uDD14</span>
           <span class="fclm-badge" id="fclm-badge-count">0</span>
           <span class="fclm-status-dot" id="fclm-status-dot" title="Firebase status"></span>
         </div>
@@ -682,6 +786,7 @@
         <span>\u26A0\uFE0F Another manager made changes</span>
         <button id="fclm-btn-sync-now">Sync Now</button>
       </div>
+      <div class="fclm-profile-section" id="fclm-profile-section"></div>
       <div class="fclm-panel-body" id="fclm-panel-body">
         <div class="fclm-empty">No active markings for today</div>
       </div>
@@ -766,11 +871,12 @@
 
     body.innerHTML = entries.map(m => {
       const s = STATUSES[m.status] || STATUSES.stu_pending;
+      const displayName = getDisplayLabel(m.employeeId, m.employeeName);
       return `
         <div class="fclm-marking-item" data-empid="${escapeHtml(m.employeeId)}" style="border-left-color:${s.border}">
           <span class="fclm-mi-icon">${s.icon}</span>
           <div class="fclm-mi-body">
-            <div class="fclm-mi-name">${escapeHtml(m.employeeName || m.employeeId)}</div>
+            <div class="fclm-mi-name">${escapeHtml(displayName)}</div>
             <div class="fclm-mi-meta">${s.label} \u00B7 by ${escapeHtml(m.markedBy)} \u00B7 ${formatTime(m.timestamp)}</div>
             ${m.notes ? `<div class="fclm-mi-notes">${escapeHtml(truncate(m.notes, 60))}</div>` : ''}
           </div>
@@ -805,79 +911,82 @@
     }
   }
 
-  // ─── Profile Employee Panel (replaces banner) ───────────────────
+  // ─── Profile Section (expands inside side panel on profile pages) ──
 
-  function updateProfilePanel() {
-    // Remove old
-    const existing = document.getElementById('fclm-profile-panel');
-    if (existing) existing.remove();
+  function updateProfileSection() {
+    const section = document.getElementById('fclm-profile-section');
+    if (!section) return;
 
-    if (!isProfilePage()) return;
+    if (!isProfilePage()) {
+      section.classList.remove('expanded');
+      setTimeout(() => {
+        if (!section.classList.contains('expanded')) section.innerHTML = '';
+      }, 400);
+      return;
+    }
 
     const empId = extractEmpIdFromHref(window.location.href);
-    if (!empId) return;
+    if (!empId) {
+      section.classList.remove('expanded');
+      return;
+    }
 
     const emp = detectedEmployees[empId];
-    const empName = emp ? emp.empName : empId;
+    const rawName = emp ? emp.empName : empId;
+    const displayName = getDisplayLabel(empId, rawName);
     const marking = currentMarkings[sanitizeKey(empId)];
     const s = marking ? STATUSES[marking.status] : null;
-
-    const panel = document.createElement('div');
-    panel.id = 'fclm-profile-panel';
 
     let statusContent;
     if (marking && s) {
       statusContent = `
-        <div class="fclm-pp-status-card" style="background:${s.bg};border-left-color:${s.border}">
-          <div class="fclm-pp-status-label">${s.icon} ${s.label}</div>
-          <div class="fclm-pp-status-meta">Marked by ${escapeHtml(marking.markedBy)} at ${formatTime(marking.timestamp)}</div>
-          ${marking.notes ? `<div class="fclm-pp-status-notes">${escapeHtml(marking.notes)}</div>` : ''}
+        <div class="fclm-ps-status-card" style="background:${s.bg};border-left-color:${s.border}">
+          <div class="fclm-ps-status-label">${s.icon} ${s.label}</div>
+          <div class="fclm-ps-status-meta">Marked by ${escapeHtml(marking.markedBy)} at ${formatTime(marking.timestamp)}</div>
+          ${marking.notes ? `<div class="fclm-ps-status-notes">${escapeHtml(marking.notes)}</div>` : ''}
         </div>
-        <div class="fclm-pp-actions">
-          <button class="fclm-pp-btn-change" id="fclm-pp-change">Change Status</button>
-          <button class="fclm-pp-btn-clear" id="fclm-pp-clear">Clear</button>
+        <div class="fclm-ps-actions">
+          <button class="fclm-ps-btn-change" id="fclm-ps-change">Change Status</button>
+          <button class="fclm-ps-btn-clear" id="fclm-ps-clear">Clear</button>
         </div>
       `;
     } else {
       statusContent = `
-        <div class="fclm-pp-no-status">No active marking for this associate</div>
-        <div class="fclm-pp-actions">
-          <button class="fclm-pp-btn-mark" id="fclm-pp-mark">Mark This Associate</button>
+        <div class="fclm-ps-no-status">No active marking for this associate</div>
+        <div class="fclm-ps-actions">
+          <button class="fclm-ps-btn-mark" id="fclm-ps-mark">Mark This Associate</button>
         </div>
       `;
     }
 
-    panel.innerHTML = `
-      <div class="fclm-pp-header" id="fclm-pp-drag">
-        <span>Employee Status</span>
-      </div>
-      <div class="fclm-pp-body">
-        <div class="fclm-pp-empname">${escapeHtml(empName)}</div>
-        <div class="fclm-pp-empid">ID: ${escapeHtml(empId)}</div>
-        ${statusContent}
-      </div>
+    section.innerHTML = `
+      <div class="fclm-ps-empname">${escapeHtml(displayName)}</div>
+      <div class="fclm-ps-empid">Employee ID: ${escapeHtml(empId)}</div>
+      ${statusContent}
     `;
 
-    document.body.appendChild(panel);
-    makeDraggable(panel, document.getElementById('fclm-pp-drag'));
+    // Expand with animation
+    requestAnimationFrame(() => {
+      section.classList.add('expanded');
+    });
 
-    // Attach events
-    const markBtn = panel.querySelector('#fclm-pp-mark');
-    const changeBtn = panel.querySelector('#fclm-pp-change');
-    const clearBtn = panel.querySelector('#fclm-pp-clear');
+    // Attach button events
+    const markBtn = section.querySelector('#fclm-ps-mark');
+    const changeBtn = section.querySelector('#fclm-ps-change');
+    const clearBtn = section.querySelector('#fclm-ps-clear');
 
     if (markBtn) {
-      markBtn.addEventListener('click', () => openMarkingModal(empId, empName));
+      markBtn.addEventListener('click', () => openMarkingModal(empId, rawName));
     }
     if (changeBtn) {
-      changeBtn.addEventListener('click', () => openMarkingModal(empId, empName));
+      changeBtn.addEventListener('click', () => openMarkingModal(empId, rawName));
     }
     if (clearBtn) {
       clearBtn.addEventListener('click', async () => {
         await deleteMarking(empId);
         delete currentMarkings[sanitizeKey(empId)];
         refreshAllUI();
-        showToast(`Cleared marking for ${empName}`);
+        showToast(`Cleared marking for ${displayName}`);
       });
     }
   }
@@ -887,6 +996,7 @@
   function openMarkingModal(empId, empName) {
     closeAllModals();
     const existing = currentMarkings[sanitizeKey(empId)] || null;
+    const displayName = getDisplayLabel(empId, empName);
 
     const backdrop = document.createElement('div');
     backdrop.className = 'fclm-modal-backdrop';
@@ -908,7 +1018,7 @@
 
     modal.innerHTML = `
       <div class="fclm-modal-header">
-        ${escapeHtml(empName || empId)}
+        ${escapeHtml(displayName)}
         <small>Employee ID: ${escapeHtml(empId)}</small>
       </div>
       <div class="fclm-modal-content">
@@ -962,7 +1072,7 @@
       currentMarkings[sanitizeKey(empId)] = marking;
       refreshAllUI();
       closeAllModals();
-      showToast(`Marked ${escapeHtml(empName || empId)} as ${STATUSES[selected.value].label}`);
+      showToast(`Marked ${escapeHtml(displayName)} as ${STATUSES[selected.value].label}`);
     });
 
     // Clear
@@ -972,7 +1082,7 @@
         delete currentMarkings[sanitizeKey(empId)];
         refreshAllUI();
         closeAllModals();
-        showToast(`Cleared marking for ${escapeHtml(empName || empId)}`);
+        showToast(`Cleared marking for ${escapeHtml(displayName)}`);
       });
     }
 
@@ -981,7 +1091,7 @@
     backdrop.addEventListener('click', (e) => { if (e.target === backdrop) closeAllModals(); });
   }
 
-  // ─── Manual Add Modal (no Display Name field) ───────────────────
+  // ─── Manual Add Modal ────────────────────────────────────────────
 
   function openManualAddModal() {
     closeAllModals();
@@ -996,10 +1106,10 @@
     modal.innerHTML = `
       <div class="fclm-modal-header">
         Manual Add
-        <small>Mark an employee not detected on this page</small>
+        <small>Mark an associate not detected on this page</small>
       </div>
       <div class="fclm-modal-content">
-        <input type="text" id="fclm-manual-empid" placeholder="Employee ID or login">
+        <input type="text" id="fclm-manual-empid" placeholder="Employee ID (numeric) or login">
         <div class="fclm-status-options">
           ${Object.values(STATUSES).map(s => `
             <label class="fclm-status-option" data-status="${s.key}" style="background:${s.bg}">
@@ -1032,7 +1142,7 @@
 
     modal.querySelector('#fclm-modal-save').addEventListener('click', async () => {
       const empId = modal.querySelector('#fclm-manual-empid').value.trim();
-      if (!empId) { showToast('Please enter an Employee ID'); return; }
+      if (!empId) { showToast('Please enter an employee ID or login'); return; }
       const selected = modal.querySelector('input[name="fclm-status"]:checked');
       if (!selected) { showToast('Please select a status'); return; }
       const marking = {
@@ -1075,50 +1185,6 @@
     });
   }
 
-  // ─── Mark Buttons (Table Pages — deduplicated per row) ──────────
-
-  function injectMarkButtons() {
-    // Remove old buttons
-    document.querySelectorAll('.fclm-mark-btn').forEach(el => el.remove());
-
-    if (!isTablePage()) return;
-
-    for (const [empId, emp] of Object.entries(detectedEmployees)) {
-      // Group links by row
-      const rowsHandled = new Set();
-
-      for (const link of emp.links) {
-        const row = link.closest('tr');
-        const rowKey = row || link; // use link itself as key if no row
-
-        if (rowsHandled.has(rowKey)) continue;
-        rowsHandled.add(rowKey);
-
-        // Pick the best link in this row
-        const primaryLink = pickPrimaryLink(emp, row);
-        if (!primaryLink || primaryLink !== link) {
-          // This link is not the primary for its row — check if primary is
-          // in this iteration; if primaryLink is a different link in emp.links
-          // that shares this row, skip and let that one handle it.
-          if (primaryLink && emp.links.includes(primaryLink)) continue;
-        }
-
-        if (primaryLink && primaryLink.parentElement && !primaryLink.parentElement.querySelector('.fclm-mark-btn')) {
-          const btn = document.createElement('button');
-          btn.className = 'fclm-mark-btn';
-          btn.textContent = '\u2691';
-          btn.title = 'Mark this associate';
-          btn.addEventListener('click', (e) => {
-            e.preventDefault();
-            e.stopPropagation();
-            openMarkingModal(empId, emp.empName);
-          });
-          primaryLink.parentElement.insertBefore(btn, primaryLink.nextSibling);
-        }
-      }
-    }
-  }
-
   // ─── Row/Link Highlighting ──────────────────────────────────────
 
   function applyHighlights() {
@@ -1148,20 +1214,20 @@
         }
       });
 
-      // Inline badge — one per row only, next to primary link
+      // Inline badge — one per row, next to the name link (badge priority: name > login > id)
       const badgeRowsDone = new Set();
       for (const row of emp.rows) {
         if (!row || badgeRowsDone.has(row)) continue;
         badgeRowsDone.add(row);
-        const primaryLink = pickPrimaryLink(emp, row);
-        if (primaryLink && primaryLink.parentElement && !primaryLink.parentElement.querySelector('.fclm-inline-badge')) {
+        const badgeLink = pickBadgeLink(emp, row);
+        if (badgeLink && badgeLink.parentElement && !badgeLink.parentElement.querySelector('.fclm-inline-badge')) {
           const badge = document.createElement('span');
           badge.className = 'fclm-inline-badge';
           badge.style.backgroundColor = s.bg;
           badge.style.color = s.border;
           badge.title = `${s.label} \u2014 by ${marking.markedBy} at ${formatTime(marking.timestamp)}${marking.notes ? '\n' + marking.notes : ''}`;
           badge.innerHTML = `${s.icon} ${s.label}`;
-          primaryLink.parentElement.insertBefore(badge, primaryLink.nextSibling?.nextSibling || null);
+          badgeLink.parentElement.insertBefore(badge, badgeLink.nextSibling?.nextSibling || null);
         }
       }
     }
@@ -1207,8 +1273,7 @@
       debounceTimer = setTimeout(() => {
         detectEmployees();
         applyHighlights();
-        injectMarkButtons();
-        if (isProfilePage()) updateProfilePanel();
+        if (isProfilePage()) updateProfileSection();
       }, DEBOUNCE_MS);
     });
     observer.observe(document.body, { childList: true, subtree: true });
@@ -1237,6 +1302,7 @@
     const empEntries = Object.entries(detectedEmployees);
     const allEmpLinks = document.querySelectorAll('a[href*="employeeId"]');
     const tables = document.querySelectorAll('table');
+    const cachedLogins = Object.keys(loginCache).length;
 
     panel.innerHTML = `
       <h4>FCLM Tracker Debug</h4>
@@ -1248,11 +1314,15 @@
         <div>Manager: <strong>${escapeHtml(managerAlias)}</strong></div>
         <div>Markings: <strong>${Object.keys(currentMarkings).length}</strong></div>
         <div>Detected employees: <strong>${empEntries.length}</strong></div>
+        <div>Cached logins: <strong>${cachedLogins}</strong></div>
       </div>
 
       <details>
         <summary>Detected Employees (${empEntries.length})</summary>
-        <pre>${empEntries.map(([id, e]) => `${id}: ${e.empName} (${e.links.length} links, ${e.rows.length} rows)`).join('\n') || 'None'}</pre>
+        <pre>${empEntries.map(([id, e]) => {
+          const login = loginCache[id] ? loginCache[id].login : '?';
+          return `${id}: ${e.empName} [login: ${login}] (${e.links.length} links, ${e.rows.length} rows)`;
+        }).join('\n') || 'None'}</pre>
       </details>
 
       <details>
@@ -1275,6 +1345,11 @@
       </details>
 
       <details>
+        <summary>Login Cache</summary>
+        <pre>${JSON.stringify(loginCache, null, 2)}</pre>
+      </details>
+
+      <details>
         <summary>Raw DOM (first 3000 chars)</summary>
         <pre>${(document.body.innerHTML || '').substring(0, 3000).replace(/</g, '&lt;')}</pre>
       </details>
@@ -1286,8 +1361,7 @@
   function refreshAllUI() {
     updatePanelBody();
     applyHighlights();
-    injectMarkButtons();
-    if (isProfilePage()) updateProfilePanel();
+    updateProfileSection();
     if (DEBUG) updateDebugPanel();
   }
 
@@ -1348,11 +1422,13 @@
     GM_registerMenuCommand('Export Today\'s Markings (CSV)', () => {
       const entries = Object.values(currentMarkings).filter(m => m && m.status);
       if (entries.length === 0) { showToast('No markings to export'); return; }
-      const header = 'Employee ID,Employee Name,Status,Marked By,Time,Notes';
+      const header = 'Employee ID,Name,Login,Status,Marked By,Time,Notes';
       const rows = entries.map(m => {
         const esc = (s) => `"${String(s || '').replace(/"/g, '""')}"`;
+        const cached = loginCache[m.employeeId];
+        const login = cached ? cached.login || '' : '';
         return [
-          esc(m.employeeId), esc(m.employeeName),
+          esc(m.employeeId), esc(m.employeeName), esc(login),
           esc((STATUSES[m.status] || {}).label || m.status),
           esc(m.markedBy), esc(formatTime(m.timestamp)), esc(m.notes),
         ].join(',');
@@ -1386,11 +1462,11 @@
       modal.innerHTML = `
         <div class="fclm-alias-header">
           <div class="fclm-alias-logo">\uD83D\uDCCB</div>
-          <h2>Should I Code? 🤔</h2>
-          <p>${isChange ? 'Update your manager alias' : 'Welcome! Enter your login to get started.'}</p>
+          <h2>Should I Code? \uD83E\uDD14</h2>
+          <p>${isChange ? 'Update your manager login' : 'Welcome! Enter your login to get started.'}</p>
         </div>
         <div class="fclm-alias-body">
-          <label>Manager Alias</label>
+          <label>Manager Login</label>
           <input type="text" id="fclm-alias-input" placeholder="e.g. jsmith"
                  value="${isChange && managerAlias ? escapeHtml(managerAlias) : ''}" autocomplete="off" spellcheck="false">
           <div class="fclm-alias-hint">Use your Amazon login (the part before @)</div>
@@ -1406,11 +1482,9 @@
       const input = modal.querySelector('#fclm-alias-input');
       const btn = modal.querySelector('#fclm-alias-submit');
 
-      // Enable/disable button based on input
       input.addEventListener('input', () => {
         btn.disabled = !input.value.trim();
       });
-      // If changing, button should be enabled if there's existing value
       if (isChange && managerAlias) btn.disabled = false;
 
       input.focus();
@@ -1421,7 +1495,7 @@
         managerAlias = val;
         GM_setValue('managerAlias', managerAlias);
         closeAllModals();
-        if (isChange) showToast(`Alias updated to ${managerAlias}`);
+        if (isChange) showToast(`Login updated to ${managerAlias}`);
         resolve(val);
       }
 
@@ -1430,7 +1504,6 @@
         if (e.key === 'Enter') submit();
       });
 
-      // Only allow closing on change, not on first run
       if (isChange) {
         backdrop.addEventListener('click', (e) => {
           if (e.target === backdrop) { closeAllModals(); resolve(managerAlias); }
@@ -1451,35 +1524,31 @@
   // ─── Initialization ──────────────────────────────────────────────
 
   async function init() {
-    log('Initializing Should I Code?...');
+    log('Initializing...');
 
-    // Detect page type and date early (before UI)
     currentPageType = detectPageType();
     currentDateKey = getDateKey();
     log('Page type:', currentPageType, '| Date key:', currentDateKey);
 
-    // Inject styles first so modals look correct
     injectStyles();
 
-    // Manager alias (may show modal)
     await ensureAlias();
-    log('Manager alias:', managerAlias);
+    log('Manager login:', managerAlias);
 
-    // Create UI
+    // Load cached logins from local storage
+    loadLoginCache();
+
     createPanel();
     createDebugPanel();
 
-    // Register menu commands
     registerMenuCommands();
 
-    // Wait for content to load
     await waitForContent();
     log('Content ready');
 
-    // Detect employees
     detectEmployees();
 
-    // Fetch markings
+    // Fetch markings from Firebase
     const markings = await fetchMarkings();
     if (markings !== null) {
       currentMarkings = markings;
@@ -1488,15 +1557,18 @@
       updateConnectionStatus(false);
     }
 
-    // Refresh UI
+    // Resolve logins via ADAPT API (non-blocking UI update after)
+    resolveLogins().then(() => {
+      refreshAllUI();
+    });
+
+    // Initial UI render (with whatever login data is cached)
     refreshAllUI();
 
-    // Setup interactions
     setupContextMenu();
     setupKeyboardShortcuts();
     setupMutationObserver();
 
-    // Start polling
     startPolling();
 
     // Cleanup old markings (fire and forget)

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Should I Code? 🤔
 // @namespace    https://fclm-adapt-tracker
-// @version      1.2.5
+// @version      1.2.6
 // @author       Micah Griffth | Area Manager II | HDC3
 // @description  Collaborative AA status tracking for HDC3 warehouse managers
 // @match        https://fclm-portal.amazon.com/*
@@ -1025,9 +1025,17 @@
 
     makeDraggable(panel, document.getElementById('fclm-panel-drag'));
 
+    // Restore minimized state from previous session
+    if (GM_getValue('fclm_panelMinimized', false)) {
+      panel.classList.add('minimized');
+      document.getElementById('fclm-btn-minimize').textContent = '\u25A1';
+    }
+
     document.getElementById('fclm-btn-minimize').addEventListener('click', () => {
       panel.classList.toggle('minimized');
-      document.getElementById('fclm-btn-minimize').textContent = panel.classList.contains('minimized') ? '\u25A1' : '\u2500';
+      const isMinimized = panel.classList.contains('minimized');
+      document.getElementById('fclm-btn-minimize').textContent = isMinimized ? '\u25A1' : '\u2500';
+      GM_setValue('fclm_panelMinimized', isMinimized);
     });
 
     document.getElementById('fclm-btn-add').addEventListener('click', openManualAddModal);

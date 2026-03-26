@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Should I Code? 🤔
 // @namespace    https://fclm-adapt-tracker
-// @version      1.2.0
+// @version      1.2.1
 // @author       Micah Griffth | Area Manager II | HDC3
 // @description  Collaborative AA status tracking for HDC3 warehouse managers
 // @match        https://fclm-portal.amazon.com/*
@@ -470,14 +470,10 @@
         found[empId] = { empId, empName: empName || empId, links: [], rows: [] };
       }
       if (empName && empName !== empId) {
-        // On profile pages, only accept names that contain a comma ("Last, First")
-        // or are a single-word login. This prevents page navigation text like
-        // "Time Details" or "Current Punches" from being used as a name.
-        if (isProfilePage()) {
-          if (empName.includes(',') || /^[a-zA-Z]+$/.test(empName.trim())) {
-            found[empId].empName = empName;
-          }
-        } else {
+        // On profile pages, don't accept names from link text scanning —
+        // links contain UI text like "Submit", "Time Details", etc.
+        // The real name comes from the page heading parse in Strategy 5.
+        if (!isProfilePage()) {
           found[empId].empName = empName;
         }
       }
@@ -519,12 +515,36 @@
       }
     });
 
-    // Strategy 5: Profile page URL
+    // Strategy 5: Profile page — parse heading for name and login
+    // The page heading follows the pattern: "Last,First (login)(Xm)"
+    // e.g. "Griffith,Micah (mgrffth)(0m)"
     if (isProfilePage()) {
-      const empId = extractEmpIdFromHref(window.location.href);
-      if (empId && !found[empId]) {
-        // Only add if not already found by earlier strategies
-        addEmployee(empId, null, null, null);
+      const urlEmpId = extractEmpIdFromHref(window.location.href);
+      if (urlEmpId) {
+        let empName = null;
+        let empLogin = null;
+
+        // Search page text for the "Name,Name (login)(Xm)" pattern
+        const bodyText = document.body.textContent || '';
+        const headingMatch = bodyText.match(/([A-Za-z][A-Za-z' -]+,\s*[A-Za-z][A-Za-z' -]+)\s*\(([a-zA-Z]+)\)\s*\(\d+m?\)/);
+        if (headingMatch) {
+          empName = headingMatch[1].trim();
+          empLogin = headingMatch[2];
+        }
+
+        // Ensure employee entry exists
+        if (!found[urlEmpId]) {
+          found[urlEmpId] = { empId: urlEmpId, empName: empName || urlEmpId, links: [], rows: [] };
+        } else if (empName) {
+          // Override any bad name that leaked through from link scanning
+          found[urlEmpId].empName = empName;
+        }
+
+        // Cache the login extracted from the heading
+        if (empLogin) {
+          loginCache[urlEmpId] = { login: empLogin, timestamp: Date.now() };
+          saveLoginCache();
+        }
       }
     }
 
@@ -1045,10 +1065,12 @@
     const emp = detectedEmployees[empId];
     const rawName = emp ? emp.empName : null;
     const cached = loginCache[empId];
-    const login = cached ? cached.login : null;
-    // For the profile section header, show name on its own line (no login suffix)
-    // and show login on a separate sub-line
+    const isNumericId = /^\d+$/.test(empId);
+    // Login: from cache, or if the URL empId itself is a login (not numeric)
+    const login = cached ? cached.login : (!isNumericId ? empId : null);
+    // Name: from detection (heading parse), fall back to login or empId
     let nameDisplay = rawName && rawName !== empId ? rawName : (login || empId);
+    // Sub-line: always prefer showing AA Login when we have it
     const subLine = login ? `AA Login: ${login}` : `Employee ID: ${empId}`;
     const marking = currentMarkings[sanitizeKey(empId)];
     const s = marking ? STATUSES[marking.status] : null;

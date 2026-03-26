@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Should I Code? 🤔
 // @namespace    https://fclm-adapt-tracker
-// @version      1.2.2
+// @version      1.2.3
 // @author       Micah Griffth | Area Manager II | HDC3
 // @description  Collaborative AA status tracking for HDC3 warehouse managers
 // @match        https://fclm-portal.amazon.com/*
@@ -477,12 +477,37 @@
     return text || null;
   }
 
+  // Scan a table row's cells for a "Last, First" style name.
+  // On TOT/PPR pages, the link text is often just the numeric employee ID,
+  // while the actual name is in an adjacent <td> cell.
+  function findNameInRow(row, empId) {
+    if (!row) return null;
+    for (const td of row.querySelectorAll('td')) {
+      // Skip manager column
+      if (td.classList.contains('manager')) continue;
+      const text = td.textContent.trim();
+      // Match "Last,First" or "Last, First" pattern
+      if (text && text !== empId && /^[A-Za-z][A-Za-z' -]+,\s*[A-Za-z]/.test(text)) {
+        return text;
+      }
+    }
+    return null;
+  }
+
   function detectEmployees() {
     const found = {};
 
     function addEmployee(empId, empName, link, row) {
       if (!empId) return;
       empId = empId.trim();
+
+      // If the name is just the employee ID (or missing), scan the row
+      // for a real "Last, First" name from adjacent table cells
+      if ((!empName || empName === empId || /^\d+$/.test(empName)) && row) {
+        const rowName = findNameInRow(row, empId);
+        if (rowName) empName = rowName;
+      }
+
       if (!found[empId]) {
         found[empId] = { empId, empName: empName || empId, links: [], rows: [] };
       }
